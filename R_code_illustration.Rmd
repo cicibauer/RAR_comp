@@ -1,0 +1,407 @@
+---
+title: "Manuscript"
+output: 
+  html_notebook:
+    toc: true
+    toc_depth: 4
+    theme: lumen
+date: '`r format(Sys.time(), "%B %d, %Y")`'
+---
+
+This R Markdown Notebook provides R codes to fit the extended cosinor model, fPCA and HHMM discussed in the manuscript XXX.
+
+```{r}
+# set up R environment
+suppressPackageStartupMessages({
+  library(tidyverse); library(scales);library(ggplot2); library(depmixS4)
+  })
+```
+
+# Sample Data
+
+In this sample actigraphy data, we provide two example subjects from NHANES 2011-2014. We use these two example subjects to illustrate the usage of R codes developed for three models and investigate their Rest-Activity Rhythms (RAR).
+
+```{r}
+dat <- readRDS("two_example_subjects_raw_actigraphy.rds")
+# subject id
+id <- unique(dat$SEQN)
+```
+
+```{r}
+my_theme <- function(){
+  theme_bw(base_size = 16, base_family = "sans") %+replace%
+  theme(
+    plot.title = element_text(
+      size = 13, face = "bold", hjust = 0, margin=margin(b = 8, unit = "pt")
+      ), 
+    plot.subtitle = element_text(
+      size = 12, hjust = 0, margin=margin(b = 8, unit = "pt")
+      ), 
+    legend.title = element_blank(), 
+    legend.text = element_text(size=16),                  
+    axis.text = element_text(size=12), 
+    panel.grid.minor = element_blank(), 
+    axis.text.x = element_text(angle = 0, vjust = 1, hjust=1), 
+    axis.text.y = element_text(size = 10),
+    axis.title=element_text(size=12,face="bold"),
+    strip.text.y = element_text(size = 12), legend.position="right"
+    )}
+```
+
+# Extended Cosinor Model
+
+Step 1: Data preparation. Use logarithm transform the data.
+
+```{r}
+# subject 1 used in the manuscript
+example.id <- id[1]
+df <- dat %>% filter (SEQN == example.id)
+
+# get date and time variables 
+time_zone <- lubridate::tz(df$datetime)
+df$date <- as.Date(df$datetime, tz=time_zone)
+df$time <- format(df$datetime,"%H:%M:%S")
+#dates <- unique(df$date)
+#df$day <- match(df$date, dates)
+df$day <- as.numeric(df$day)
+# clock time in minutes
+df$tm <- lubridate::hour(df$datetime)*60 + lubridate::minute(df$datetime) + lubridate::second(df$datetime)/60
+df$thrs <- lubridate::hour(df$datetime) + lubridate::minute(df$datetime)/60  + lubridate::second(df$datetime)/3600
+df$td <- (df$day - 1) * 1440 + df$tm
+df$n <- seq(1, nrow(df))
+
+# logarithm transformation for actigraphy data
+df$log.act <- log(df$activity_avg + 1)
+```
+
+Step 2. Fit the cosine model, which is the null model to be compared with the improved model fitting from extended cosinor model.
+
+```{r}
+# Specify staring values for initial cosine model
+mMeanAct <- mean(df$log.act, na.rm = FALSE)
+aStartAct = mMeanAct - min(df$log.act, na.rm = FALSE)
+#start_cosine = as.data.frame(cbind(mMeanAct, aStartAct))
+
+# Initial Cosine Model
+# @amp: Amplitude
+# @M: MESOR
+# @phi: acrophase
+cosine <- stats::nls(
+  log.act ~ (amp + M) + amp*cos((tm/60 - phi)*pi/12)
+  , data = df
+  , start = list(amp = aStartAct, M = mMeanAct, phi = 12)
+  , algorithm = "port"
+  , control = list(warnOnly = T)
+  , trace=F
+  , lower=c(0, 0, -6), upper=c(Inf, Inf, 30)
+  )
+
+# Saving estimates of Initial Cosine Model to use as starting values for Fitted Extended Cosine Model
+cos.coefs <- stats::coef(cosine)
+```
+
+Step 3. Fit the extended cosinor model.
+
+```{r}
+ex_cosine <- NULL; attempt <- 0
+
+# fit the model until convergence reached
+while( is.null(ex_cosine) &&  attempt <= 20 ) {
+  attempt <- attempt + 1
+  try(
+    ex_cosine <- stats::nls(
+      log.act ~ mn + amp*(
+        exp(beta*(cos((tm/60 - phi)*pi/12)- alpha))
+        /(1+exp(beta*(cos((tm/60 - phi)*pi/12) - alpha)))
+        )
+      , data = df
+      # starting values are from the fitting cosine model
+      , start = list(
+        amp=cos.coefs[[1]], mn=cos.coefs[[2]], phi=cos.coefs[[3]], alpha=0, beta=2
+        )
+      , control = list(maxiter = 1000, warnOnly = T)
+      , trace = F, algorithm = "port"
+      , lower = c(0, 0, -6, -1, 0), upper=c(Inf, Inf, 30, 1, Inf))
+    , silent=T
+  )}
+```
+
+Step 4. Extract model estimates.
+
+```{r}
+# Coefficient estimates of extended cosine
+final.ests = as.data.frame(t(stats::coef(ex_cosine)))
+
+# Predicted Values & Residuals
+exp_trans <- function(x){return(exp(x) - 1)}
+
+# Fit predicted values based on observed non-missing data
+df$predicted <- as.numeric(stats::predict(ex_cosine, data.frame( tm = df$tm ) )) 
+
+# Predicted based on log(act + 1)
+df$resid <- df$log.act - df$predicted # residuals of log(act + 1)
+
+# Predicting based on Interpolated Data
+obs.per.min <- df$tm[2] - df$tm[1]
+
+# Create interpolated data
+interp.td <- with(df, seq(min(td), max(td), by = obs.per.min)) 
+
+# Predictions based on interpolated data
+interp.pred <- as.data.frame(
+  as.numeric(stats::predict(ex_cosine, newdata = list(tm = interp.td)))
+  ) 
+colnames(interp.pred) <- "interp.pred"
+# number of minutes after first midnight
+interp.pred$td <- interp.td 
+
+# Exponentiation of predicted values and residuals
+df$e_predicted <- exp_trans(df$predicted)
+df$e_resid <- exp_trans(df$log.act) - df$e_predicted
+interp.pred$e_interp.pred <- exp_trans(interp.pred$interp.pred)
+
+# Merge interpolated data with original data (for plotting purposes, keep all NAs)
+df_interp <- merge(df, interp.pred, by="td", all.y = TRUE)
+
+# Calculating F Statistic
+diff.mean.sq <- (df$predicted - mean(df$log.act))^2
+RSS <- sum(diff.mean.sq)/4
+MSE <- sum(df$resid^2)/(nrow(df)-5)
+F_stat <- RSS/MSE
+
+# Calculating Other RAR Parameters
+alpha = final.ests$alpha
+beta = final.ests$beta
+acrophase = final.ests$phi
+amp = exp(final.ests$amp)
+mesor = exp(final.ests$mn + final.ests$amp/2)
+log_amp = final.ests$amp
+log_mesor = final.ests$mn + final.ests$amp/2
+tLeft = final.ests$phi - acos(final.ests$alpha)/(2*pi/24)
+tRight = final.ests$phi + acos(final.ests$alpha)/(2*pi/24)
+ExtCos_params <- as.data.frame(
+  cbind(example.id, alpha, beta, acrophase, amp, mesor, log_amp, log_mesor, tLeft, tRight, F_stat)
+  )
+
+print(ExtCos_params)
+```
+
+
+```{r}
+# Plot on Log Scale
+plot_title <- "Observed and Predicted Activity (with missingness)"
+day_labels <- unique(df$day)
+day_labels <- as.character(day_labels[stats::complete.cases(day_labels)])
+
+ggplot2::ggplot(df, aes(x = td, y = log.act, group=1)) +
+  ggplot2::geom_point(size=1, color="grey20", shape=1) + 
+  my_theme() + 
+  ggplot2::geom_line(
+    data=df
+    , aes(x = td, y = predicted, group=1, color = as.factor(is.na(day)))
+    , linewidth = 1, show.legend = F
+    ) +
+  ggplot2::labs(
+    title = paste0('ID=', example.id)
+    , x = "Days of Observation"
+    , y = "Log(activity + 1)"
+    , col = "Missing Data"
+    ) +
+  labs(
+    title = paste0('ID=', example.id)
+    , subtitle = "anti-logistic-transformed cosine curve"
+    , x = "Days of Observation"
+    , y = "Log(Activity Counts + 1)"
+    , col = "Missing Data"
+    ) +
+  ggplot2::scale_x_continuous(
+    breaks = seq(min(df$td), max(df$td), by = 1440)
+    , labels = day_labels
+    ) 
+```
+
+# Functional Principal Component Analysis
+
+# Harmonic Hidden Markov Model
+
+Step 1. Fit Harmonic Hidden Markov Model.
+
+```{r}
+# Sampling frequency in hour unit. In our study, sf = 5min/60min = 1/12 
+sf <- 1/12 
+df$lag <- seq(0,(nrow(df)-1)) 
+# circadian oscillators
+df$sin_part <- sin(2*pi*df$lag*sf/24) 
+df$cos_part <- cos(2*pi*df$lag*sf/24) 
+
+df$y <- sqrt(df$activity_avg)
+
+HMM_hmc <- NULL; attempt <- 0
+y_hmc <- depmix(
+  y ~ 1, data = df
+  , transition = ~ sin_part + cos_part
+  , nstates = 3
+  , family = gaussian()
+  , ntimes = nrow(df)
+  )
+
+### first try without any data padding
+while( is.null(HMM_hmc) &&  attempt <= 20 ) {
+  attempt <- attempt + 1
+  try( HMM_hmc <- fit(y_hmc, verbose=F), silent = T)
+} 
+attempt <- 0 ### reset counter
+```
+
+
+```{r}
+### OPTIONAL
+### in case of failed convergence, add data padding
+while( is.null(HMM_hmc) &&  attempt <= 20 ) {
+  ### adding a bit value to the zeros
+  df_padded <- df
+  ind <- which(df_padded$y == 0); #length(ind)
+  df_padded$y[ind] <- log(
+    rbinom(length(ind), size = 1, prob = 0.5) + 1
+    )  ### equal chance to be 0 or 1
+  
+  y_hmc <- depmix(
+    y ~ 1
+    , data = df_padded
+    , transition = ~ sin_part + cos_part
+    , nstates = 3
+    , family = gaussian()
+    , ntimes = nrow(df_padded)
+    )
+  try(HMM_hmc <- fit(y_hmc,verbose=F), silent = T)
+}   
+attempt <- 0 ### reset counter
+```
+
+Step 2. Extract model estimates.
+
+```{r}
+# Function developed by (Huang, 2018) to extract estimates of key parameters, for example, mean levels of three hidden activity states and circadian oscillated time-varying transition probabilities and state probabilities.
+
+source("Harmonic_HMMs.r")
+
+# Note: the output printed from Harmonic_HMMs() function is the model fitting results from using depmixS4::depmix
+HMM_results_hmc <- Harmonic_HMMs(
+  HMM = HMM_hmc
+  , sin_part = df$sin_part
+  , cos_part = df$cos_part
+  )
+```
+
+```{r}
+# extract the oscillated state probability 
+circadian_states_prob <- HMM_results_hmc$circadian_states_prob 
+# convert time variable to clock time
+time <- as.POSIXct(df$time, format = "%H:%M:%S") 
+# self-define the start hour of a day at 12 pm
+hour_day_start <- 12 
+# define a function to locate the first start hour of a day, since there are multiple days of records.
+find_day_start <- function(hour_day_start,time){ 
+  hour_time <- hour(time)
+  min_time <- minute(time) 
+  A <- which(hour_time == 12) 
+  B <- which(min_time < 60*sf) 
+  one_day_start <- A[min(which(A %in% B, arr.ind = TRUE))] 
+  return(one_day_start) 
+} 
+
+one_day_start <- find_day_start(hour_day_start = hour_day_start, time = time) 
+# we use 5-mins data (sf=1/12) so that one day has 24*12=288 points 
+one_day_end <- one_day_start + (24/sf-1) 
+# one day profile of three states probability
+one_day_prob <- circadian_states_prob[one_day_start:one_day_end, ]
+
+# inactive state probability 
+p1 <- one_day_prob$state_1 
+# moderately active state probability 
+p2 <- one_day_prob$state_2 
+# highly active state probability
+p3 <- one_day_prob$state_3 
+```
+
+Step 3. Calculate RAR parameters using one 24-hour state probabilities.
+
+```{r}
+# amount of rest: duration of rest per day (hours) 
+rest_amount <- 24*mean(p1, na.rm = T)
+
+# absolute index to compute the gravity center (in the unit of hours) of p1
+# the index is in 5-min epochs, same as the actigraphy data.
+index <- seq(0, 24-1/12, 1/12)  
+# center of rest (CRC) which corresponds to the gravity center of p1
+# Note from Huang, 2018: the definition of only valid with suitably defined hour_day_start where the major resting window is of one 24 hours.
+center_rest <- sum(p1*index/sum(p1, na.rm = T), na.rm = T) 
+
+# center_rest is the position in index not the clock time. 
+## #One can easily convert it to clock time via: 
+index_clocktime <- seq(hour_day_start, hour_day_start + 24 - sf, sf) 
+clocktime <- index_clocktime 
+clocktime[index_clocktime>24]<-(index_clocktime-24)[index_clocktime>24] 
+center_rest_clock <- clocktime[which.min(abs(index-center_rest))] 
+
+#worst clock : complete lack of circadian rhythm where the probability of rest is constant and equal to rest_amount/24
+worst_p1 <- rep(mean(p1, na.rm = T), 24/sf)
+
+# perfect clock: major resting window has no interruptions 
+find_perfect_p1 <- function(center_rest, rest_amount, index, sf){ 
+  
+  perfect_p1 <- rep(0, 24/sf) 
+  
+  t1 <- center_rest - rest_amount/2 
+  t2 <- center_rest + rest_amount/2 
+  
+  perfect_t2<-which.min(abs(index-center_rest)) 
+  perfect_t1<-which.min(abs(index-center_rest+rest_amount/2)) 
+  perfect_t3<-which.min(abs(index-center_rest-rest_amount/2)) 
+  
+  perfect_p1[perfect_t1:perfect_t3] <- 1 
+  
+  if(t2>max(index)){offset<-round((t2-max(index))/sf);perfect_p1[1:offset]<-1} 
+  if(t1<min(index)){offset<-round((min(index)-t1)/sf);perfect_p1[-offset+L,L]<-1} 
+  
+  return(perfect_p1) 
+} 
+
+perfect_p1 <- find_perfect_p1(center_rest, rest_amount, index, sf) 
+
+# Rhythmic index (RI). 
+RI <- (sum(p1[which(perfect_p1 > 0)])*sf/rest_amount-rest_amount/24)*24/(24- rest_amount) 
+
+# the clock time of the highest IA probability 
+MIPP <- clocktime[which(p1 == max(p1))]
+# the clock time of the highest HA probability 
+MAPP <- clocktime[which(p3 == max(p3))]
+
+# Gaussian emission parameters of activity levels
+state_means <- HMM_results_hmc$obs_params$mean
+state_sds <- HMM_results_hmc$obs_params$sd
+# the mean levels from the original output from depmixS4::depmix() results are not in increasing order from low to high. Reorder the states to determine the estimates for inactive, moderately active, and highly active activity states with mean levels from low to high.
+reorder_index <- order(state_means)
+# Mean levels of hidden activity states
+IA_mean <- state_means[reorder_index[1]]; IA_sd <- state_sds[reorder_index[1]]
+MA_mean <- state_means[reorder_index[2]]; MA_sd <- state_sds[reorder_index[2]]
+HA_mean <- state_means[reorder_index[3]]; HA_sd <- state_sds[reorder_index[3]]
+
+HHMM_params <- as.data.frame(
+  cbind(example.id, RI, RA = rest_amount, CRC = center_rest_clock
+        , MIPP, MAPP, IA_mean, IA_sd, MA_mean, MA_sd, HA_mean, HA_sd)
+  )
+print(HHMM_params)
+```
+
+
+```{r}
+index_position <- seq(0, 24, 2)
+# again the start hour of a day is 12 pm, which is also used for plotting the Rest-Activity profile
+index_lable <- c('12','14','16','18','20','22', '0/24','2','4','6','8','10','12') 
+
+par(fig = c(0, 1, 0, 1), new = F) 
+source("figure_RA_profile_HHMM.r")
+figure_day_profile(1, one_day_prob, index, index_position, index_lable)
+```
+
